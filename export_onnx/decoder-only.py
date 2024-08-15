@@ -1,7 +1,5 @@
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM, Phi3ForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
-from datasets import load_dataset, Audio
 import numpy as np
 import argparse
 import torch
@@ -12,7 +10,8 @@ import onnx
 from typing import Tuple, Union
 from accelerate.utils import find_tied_parameters
 from optimum.onnx import remove_duplicate_weights_from_tied_info
-
+from huggingface_hub import login
+login()
 parser = argparse.ArgumentParser()
 parser.add_argument('-m', '--model', type=str, help="The Whisper model to convert", default='Qwen/Qwen2-0.5B-Instruct')
 parser.add_argument('-l', '--length', type=int, help="The decoder model max length", default=128)
@@ -39,6 +38,7 @@ config.use_cache = True
 model = AutoModelForCausalLM.from_pretrained(
     args.model,
     config=config,
+    device_map="cpu",
 ).to(args.device).eval()
 
 tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -69,17 +69,16 @@ class AutoModelMerged(torch.nn.Module):
 
         # embedding weights are same across both submodels, hence we want to use one copy of weights
         # first we detect if they are indeed the same
-        diff = torch.sum(torch.abs(self.model.embed_tokens.weight - self.lm_head.weight)).detach()
+        # diff = torch.sum(torch.abs(self.model.embed_tokens.weight - self.lm_head.weight)).detach()
 
-        if diff.item() != 0:
-            print("Embed token weights are different than lm head weights",diff.item())
-            self.lm_head.weight = self.model.embed_tokens.weight
+        # if diff.item() != 0:
+        #     print("Embed token weights are different than lm head weights",diff.item())
+        #     self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self,
                 input_ids=None,
                 attention_mask=None,
-                output_hidden_states=None,
-                past_key_values=None,
+                output_hidden_states=None,                past_key_values=None,
                 position_ids=None)-> Union[Tuple[torch.Tensor], CausalLMOutputWithPast]:
         # Pass input through the decoder model
         # decoder non kv cache
@@ -106,7 +105,6 @@ class AutoModelMerged(torch.nn.Module):
 # create merge decoder model
 automodel_merged = AutoModelMerged(model.model, model.lm_head)
 tied_params = find_tied_parameters(automodel_merged)
-
 
 def export_decoder(output_hidden_states, max_sequence_length, verbose=False, force_convert=False, export_static=True):
     """
@@ -223,7 +221,9 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
     # only used for shape information, hence we test sending dummy value of same size as encoder output
     # decoder_input['output_hidden_states'] = torch.zeros_like(output_hidden_states).to(args.device)
     # need to pass this separately
+    # !!! WARNING: Please modify this value according to different model
     decoder_input['position_ids'] = torch.tensor([args.num_init_tokens], dtype=pos_ids_precision).to(args.device)
+    # decoder_input['position_ids'] = torch.tensor([args.num_init_tokens], dtype=pos_ids_precision).to(args.device)
     with torch.no_grad():
         output = automodel_merged(input_ids=decoder_input['input_ids'],
                             attention_mask=decoder_input['attention_mask'],
