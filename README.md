@@ -1,6 +1,13 @@
 # onnxruntime-tools
 
-Some tools to help us to work around dirty work.
+Some tools to export, convert and run onnx models. Now only support some decoder-only LLM models.
+
+## Supported model list
+```
+Qwen/Qwen2-0.5B-Instruct
+TinyLlama/TinyLlama-1.1B-Chat-v1.0
+microsoft/Phi-3-mini-4k-instruct
+```
 
 ## Requirements
 ```
