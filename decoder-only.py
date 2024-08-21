@@ -11,6 +11,7 @@ from typing import Tuple, Union
 from accelerate.utils import find_tied_parameters
 from optimum.onnx import remove_duplicate_weights_from_tied_info
 from huggingface_hub import login
+
 login()
 parser = argparse.ArgumentParser()
 parser.add_argument('-m', '--model', type=str, help="The Whisper model to convert", default='Qwen/Qwen2-0.5B-Instruct')
