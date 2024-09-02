@@ -10,8 +10,8 @@ def padding_input(input, max_sequence_length):
     return input
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-m', '--model', type=str, help="The Whisper model to convert", default='Qwen/Qwen2-0.5B-Instruct')
-parser.add_argument('-q', '--quantize', action='store_true', help='use quantized INT8 model', default=False)
+parser.add_argument('-m', '--model', type=str, help="The model to convert", default='Qwen/Qwen2-0.5B-Instruct')
+parser.add_argument('-q', '--quantize', type=int, help='whether use quantized INT4 or INT8 model', default=0)
 args = parser.parse_args()
 try:
     model = args.model.split('/')[1].replace('-', '_')
@@ -51,7 +51,12 @@ max_sequence_length = 128
 start_len = input_ids.shape[1]
 print("Prompt is: ", prompt)
 
-q_str = '_INT8' if args.quantize else ''
+if args.quantize == 0:
+    q_str = ''
+elif args.quantize == 4:
+    q_str = '_INT4'
+elif args.quantize == 8:
+    q_str = '_INT8'
 
 model_path_1 = 'logs/models/'+ model + '/' + model +'_decoder_static_non_kvcache_lm'+q_str+'.onnx'
 model_path_2 = 'logs/models/'+ model + '/' + model +'_decoder_static_kvcache_128_lm'+q_str+'.onnx'
