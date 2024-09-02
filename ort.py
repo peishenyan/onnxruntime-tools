@@ -54,7 +54,7 @@ print("Prompt is: ", prompt)
 q_str = '_INT8' if args.quantize else ''
 
 model_path_1 = 'logs/models/'+ model + '/' + model +'_decoder_static_non_kvcache_lm'+q_str+'.onnx'
-model_path_2 = 'logs/models/'+ model + '/' + model +'_decoder_static_kvcache_128_l'+q_str+'.onnx'
+model_path_2 = 'logs/models/'+ model + '/' + model +'_decoder_static_kvcache_128_lm'+q_str+'.onnx'
 
 session_1 = ort.InferenceSession(model_path_1)
 session_2 = ort.InferenceSession(model_path_2)
