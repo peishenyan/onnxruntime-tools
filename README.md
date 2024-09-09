@@ -44,6 +44,16 @@ python convert.py -path $model_relative_path
 
 The results are saved in `log/models/$model_name/$model_path_ex.onnx` and `log/models/$model_name/$model_path_ex.onnx.data` files.
 
+## Achieving ONNX model with higher opset version
+To avoid encountering the QDQ error, you can convert and save the ONNX Model to higher opset version:
+```
+python opset_convert.py -path $model_relative_path -v $opset_version
+```
+
+`$model_relative_path` is the relative path of the model you want to convert, e.g., `logs/models/Qwen2_0.5B_Instruct/Qwen2_0.5B_Instruct_decoder_static_kvcache_128_lm_ex.onnx`.
+
+The results are saved in `log/models/$model_name/$model_path_v$opset_version.onnx` and `log/models/$model_name/$model_path_v$opset_version.onnx.data` files.
+
 ## Quantize ONNX model to INT8 datatype
 We can use `quantize_dynamic` in onnxruntime.quantization lib to quantize an ONNX model into INT8 datatype.
 ```
