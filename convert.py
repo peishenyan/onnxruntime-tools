@@ -11,7 +11,7 @@ model = model_prefix.split('/')[-1]
 model_path = model_prefix+'.onnx'
 model_external_path = model_prefix+'_ex.onnx'
 
-fn = model+'_ex.onnx_data'
+fn = model+'_ex.onnx.data'
 
 onnx_model = onnx.load(model_path)
 convert_model_to_external_data(onnx_model, all_tensors_to_one_file=True, location=fn, size_threshold=1024, convert_attribute=False)
