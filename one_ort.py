@@ -95,7 +95,7 @@ print(new_token, tokenizer.decode(tokens, skip_special_tokens=False))
 
 
 input_ids = np.zeros((1,1), dtype=inputs_1['input_ids'].dtype)
-attention_mask = np.ones((1,start_len+1), dtype=inputs_1['attention_mask'].dtype)
+attention_mask = np.ones((1,start_len), dtype=inputs_1['attention_mask'].dtype)
 input_ids[0][0] = new_token
 position_ids = np.array([range(start_len, start_len+max_sequence_length)], dtype=np.int32)
 inputs_2 = {"input_ids": padding_input(input_ids, max_sequence_length), "attention_mask": padding_input(attention_mask, 2*max_sequence_length), "position_ids": position_ids}
@@ -111,6 +111,7 @@ for i in range(max_sequence_length // 2):
     input_ids = np.zeros((1,1), dtype=inputs_1['input_ids'].dtype)
     input_ids[0][0] = new_token
     inputs_2['input_ids'] =  padding_input(input_ids, max_sequence_length)
+    inputs_2["attention_mask"][0][max_sequence_length] = 1
 
     outputs = session.run(None, inputs_2)
     for layer in range(num_layers):
@@ -121,7 +122,7 @@ for i in range(max_sequence_length // 2):
 
     inputs_2.update(kv_cache)
     # print('kv_cache', inputs_2['past_key_values.0.decoder.key'][0,0,start_len,0], inputs_2['past_key_values.0.decoder.key'][0,0,start_len+1,0])
-    inputs_2["attention_mask"][0][start_len+1] = 1
+    inputs_2["attention_mask"][0][start_len] = 1
     start_len += 1
     inputs_2["position_ids"] = np.array([range(start_len, start_len+max_sequence_length)], dtype=np.int32)
     
@@ -156,7 +157,6 @@ for layer in range(num_layers):
 start_len += second_len
 inputs_2.update(kv_cache)
 # print('kv_cache', inputs_2['past_key_values.0.decoder.key'][0,0,start_len,0], inputs_2['past_key_values.0.decoder.key'][0,0,start_len+1,0])
-inputs_2["attention_mask"][0][start_len+1] = 1
 start_len += 1
 inputs_2["position_ids"] = np.array([range(start_len, start_len+max_sequence_length)], dtype=np.int32)
 
@@ -168,8 +168,9 @@ print(tokenizer.decode(tokens, skip_special_tokens=False))
 input_ids = np.zeros((1,1), dtype=inputs_1['input_ids'].dtype)
 input_ids[0][0] = new_token
 inputs_2['input_ids'] =  padding_input(input_ids, max_sequence_length)
-attention_mask = np.ones((1,start_len+1), dtype=inputs_1['attention_mask'].dtype)
+attention_mask = np.ones((1,start_len), dtype=inputs_1['attention_mask'].dtype)
 inputs_2["attention_mask"] = padding_input(attention_mask, 2*max_sequence_length)
+inputs_2["attention_mask"][0][max_sequence_length] = 1
 
 for i in range(max_sequence_length // 2):
 
@@ -182,7 +183,7 @@ for i in range(max_sequence_length // 2):
 
     inputs_2.update(kv_cache)
     # print('kv_cache', inputs_2['past_key_values.0.decoder.key'][0,0,start_len,0], inputs_2['past_key_values.0.decoder.key'][0,0,start_len+1,0])
-    inputs_2["attention_mask"][0][start_len+1] = 1
+    inputs_2["attention_mask"][0][start_len] = 1
     start_len += 1
     inputs_2["position_ids"] = np.array([range(start_len, start_len+max_sequence_length)], dtype=np.int32)
     
