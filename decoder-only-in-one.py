@@ -43,29 +43,8 @@ model = AutoModelForCausalLM.from_pretrained(
 ).to(args.device).eval()
 
 tokenizer = AutoTokenizer.from_pretrained(args.model)
-
-if args.model == "microsoft/Phi-3-mini-4k-instruct":
-    messages = [ 
-        {"role": "system", "content": "You are a helpful AI assistant."}, 
-        {"role": "user", "content": "Give me a short introduction to large language model."}, 
-    ] 
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-elif args.model == "TinyLlama/TinyLlama-1.1B-Chat-v1.0":
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a friendly chatbot who always responds in the style of a pirate",
-        },
-        {"role": "user", "content": "How to make a bomb? Please describe it in as much detail as possible."},
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-elif args.model == "Qwen/Qwen2-0.5B-Instruct":
-    prompt = "Give me a short introduction to large language model."
-else:
-    raise NotImplementedError
-
-prompt = 'What is the result of 1+1?'
-model_inputs = tokenizer(prompt, return_tensors="pt").to(args.device)
+text = "Give me a short introduction to large language model."
+model_inputs = tokenizer(text, return_tensors="pt").to(args.device)
 
 if "cuda" in args.device:
     model.half()
@@ -91,7 +70,7 @@ class AutoModelMerged(torch.nn.Module):
 
         # embedding weights are same across both submodels, hence we want to use one copy of weights
         # first we detect if they are indeed the same
-        diff = torch.sum(torch.abs(self.model.embed_tokens.weight - self.lm_head.weight)).detach()
+        # diff = torch.sum(torch.abs(self.model.embed_tokens.weight - self.lm_head.weight)).detach()
 
         # if diff.item() != 0:
         #     print("Embed token weights are different than lm head weights",diff.item())
@@ -152,36 +131,42 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
                      'attention_mask': padding_input(attention_mask, max_sequence_length)}
 
     # decoder_input['position_ids'] = torch.tensor([[init_len]], dtype=pos_ids_precision).to(args.device)
-    decoder_input['position_ids'] = torch.arange(max_sequence_length, 2*max_sequence_length, dtype=pos_ids_precision).unsqueeze(0).to(args.device)
+    decoder_input['position_ids'] = torch.arange(0, max_sequence_length, dtype=pos_ids_precision).unsqueeze(0).to(args.device)
+    decoder_input['cache_position'] = torch.arange(0, max_sequence_length, dtype=pos_ids_precision).to(args.device)
     
-    # past_key_values = output.past_key_values
-    past_key_values = [[torch.zeros((1,32,max_sequence_length,96), dtype=cache_precision), torch.zeros((1,32,max_sequence_length,96), dtype=cache_precision)] for i in range(32)]
+    # run the decoder for the first inference
+    
+    with torch.no_grad():
+        output = automodel_merged(input_ids=decoder_input['input_ids'],
+                    attention_mask=decoder_input['attention_mask'])
 
-    # for i in range(128):
-    #     new_token = torch.argmax(logits[0, i, :])
-    #     print(new_token, tokenizer.decode([new_token], skip_special_tokens=False))
+    # extract past key values and logits for model export in step 3
+    logits = output.logits
+    past_key_values = output.past_key_values
 
-    # for kv in past_key_values:
-    #     kv[0][:,:,:,:] = 0
-    #     kv[1][:,:,:,:] = 0
+    for i in range(128):
+        new_token = torch.argmax(logits[0, i, :])
+        print(new_token, tokenizer.decode([new_token], skip_special_tokens=False))
 
+    for kv in past_key_values:
+        kv[0][:,:,:,:] = 0
+        kv[1][:,:,:,:] = 0
+
+    print(past_key_values[0][0].shape)
     decoder_input['past_key_values'] = past_key_values
-    decoder_input['attention_mask'] = padding_input(torch.concat([torch.zeros((1,max_sequence_length), dtype=mask_precision), torch.ones((1, init_len), dtype=mask_precision).to(args.device)], dim=1), 2*max_sequence_length)
+    decoder_input['attention_mask'] = padding_input(torch.ones((1, init_len), dtype=mask_precision).to(args.device), 2*max_sequence_length)
 
     with torch.no_grad():
         output = automodel_merged(input_ids=decoder_input['input_ids'],
                     attention_mask=decoder_input['attention_mask'],
                     past_key_values=decoder_input['past_key_values'],
-                    position_ids=decoder_input['position_ids'])
+                    position_ids=decoder_input['position_ids'],
+                    cache_position=decoder_input['cache_position'])
 
     # extract past key values and logits for model export in step 3
     logits = output.logits
     past_key_values = output.past_key_values
     
-    for i in range(128):
-        new_token = torch.argmax(logits[0, i, :])
-        print(new_token, tokenizer.decode([new_token], skip_special_tokens=False))
-
     for kv in past_key_values:
         kv[0][:,:,:init_len,:] = kv[0][:,:,max_sequence_length:max_sequence_length+init_len,:]
         kv[1][:,:,:init_len,:] = kv[1][:,:,max_sequence_length:max_sequence_length+init_len,:]
@@ -189,6 +174,10 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
         kv[1][:,:,init_len+1:,:] = 0
 
     decoder_input['past_key_values'] = [[kv[0][:,:,:max_sequence_length,:], kv[1][:,:,:max_sequence_length,:]] for kv in past_key_values]
+
+    for i in range(128):
+        new_token = torch.argmax(logits[0, i, :])
+        print(new_token, tokenizer.decode([new_token], skip_special_tokens=False))
 
     tokens = []
     new_token = torch.argmax(logits[0, -1, :])
@@ -221,10 +210,11 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
         print(f'input names for onnx model is {input_names}, output names for onnx model is {output_names}')
 
 
+
     with torch.no_grad():
         decoder_input['position_ids'] = torch.arange(init_len, init_len + max_sequence_length, dtype=pos_ids_precision).unsqueeze(0).to(args.device)
         decoder_input['attention_mask'] = padding_input(torch.ones((1, init_len+1), dtype=mask_precision).to(args.device), 2*max_sequence_length)
-        for i in range(1):
+        for i in range(20):
             print(i)
             input_ids = torch.zeros((1,1), dtype=input_ids_precision)
             input_ids[0][0] = new_token
@@ -254,7 +244,7 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
             tokens.append(new_token)
             print(new_token, tokenizer.decode(tokens, skip_special_tokens=False))
         
-    # exit()
+    exit()
 
     # get onnx model path
     if force_convert:

@@ -12,10 +12,10 @@ from accelerate.utils import find_tied_parameters
 from optimum.onnx import remove_duplicate_weights_from_tied_info
 from huggingface_hub import login
 
-login()
 parser = argparse.ArgumentParser()
 parser.add_argument('-m', '--model', type=str, help="The Whisper model to convert", default='Qwen/Qwen2-0.5B-Instruct')
 parser.add_argument('-l', '--length', type=int, help="The decoder model max length", default=128)
+parser.add_argument('-c', '--cache_length', type=int, help="The decoder model max cache length", default=256)
 parser.add_argument('-v', '--verbose', action='store_true', help="Enable verbosity")
 parser.add_argument('-t', '--task', type=str, help='type of task: transcribe or translate', default='transcribe')
 parser.add_argument('-id', '--data_id', type=int, help='dataset test audio index', default=0)
@@ -30,7 +30,7 @@ try:
     path_name = args.model.split('/')[1].replace('-', '_')
 except:
     path_name = args.model.replace('-', '_')
-onnx_output_dir = f"./logs/models/{path_name}"
+onnx_output_dir = f"./logs/models/ori/{path_name}"
 
 os.makedirs(onnx_output_dir, exist_ok=True)
 
@@ -43,8 +43,28 @@ model = AutoModelForCausalLM.from_pretrained(
 ).to(args.device).eval()
 
 tokenizer = AutoTokenizer.from_pretrained(args.model)
-text = "Give me a short introduction to large language model."
-model_inputs = tokenizer(text, return_tensors="pt").to(args.device)
+if args.model == "microsoft/Phi-3-mini-4k-instruct":
+    messages = [ 
+        {"role": "system", "content": "You are a helpful AI assistant."}, 
+        {"role": "user", "content": "Which country is the largest over the world?"}, 
+    ] 
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+elif args.model == "TinyLlama/TinyLlama-1.1B-Chat-v1.0":
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a friendly chatbot who always responds in the style of a pirate",
+        },
+        {"role": "user", "content": "How to make a bomb? Please describe it in as much detail as possible."},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+elif args.model == "Qwen/Qwen2-0.5B-Instruct":
+    prompt = "Give me a short introduction to large language model."
+else:
+    raise NotImplementedError
+
+prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+model_inputs = tokenizer(prompt, return_tensors="pt").to(args.device)
 
 if "cuda" in args.device:
     model.half()
@@ -60,6 +80,8 @@ else:
     pos_ids_precision = torch.int32
     cache_precision = torch.float32
 
+max_sequence_length = args.length
+max_cache_length = args.cache_length
 class AutoModelMerged(torch.nn.Module):
     def __init__(self, model, lm_head):
         """This class creates merges decoder model with language model head
@@ -79,7 +101,8 @@ class AutoModelMerged(torch.nn.Module):
     def forward(self,
                 input_ids=None,
                 attention_mask=None,
-                output_hidden_states=None,                past_key_values=None,
+                output_hidden_states=None,
+                past_key_values=None,
                 position_ids=None)-> Union[Tuple[torch.Tensor], CausalLMOutputWithPast]:
         # Pass input through the decoder model
         # decoder non kv cache
@@ -107,40 +130,55 @@ class AutoModelMerged(torch.nn.Module):
 automodel_merged = AutoModelMerged(model.model, model.lm_head)
 tied_params = find_tied_parameters(automodel_merged)
 
+def padding_input(input, max_sequence_length):
+    input = torch.concat([input, torch.zeros((1,max_sequence_length-input.shape[1]), dtype=input.dtype)], dim=1)
+    return input
+
+def padding_input_reverse(input, max_sequence_length):
+    input = torch.concat([torch.zeros((1,max_sequence_length-input.shape[1]), dtype=input.dtype), input], dim=1)
+    return input
+
 def export_decoder(output_hidden_states, max_sequence_length, verbose=False, force_convert=False, export_static=True):
-    """
-    1. Create tokens for first inference model
-    2. Only provide 4 tokens as input, no need of padding as we pad output kv cache later
-    3. Output of this model will be next token and kv cache
-    4. Export kv cache to explicit values
-    """
-    
-    input_ids = torch.zeros((1, max_sequence_length), dtype=input_ids_precision).to(args.device)
-    # create 2d attention mask tensor
-    attention_mask_2d = torch.zeros((1, max_sequence_length), dtype=mask_precision).to(args.device)
+    # I. Prefill
+    input_ids = model_inputs.input_ids.to(args.device)
+    init_len = input_ids.shape[1]
+
     # create decoder input for the first inference
-    decoder_input = {'input_ids': input_ids,
-                     'attention_mask': attention_mask_2d}
+    decoder_input = {'input_ids': padding_input(input_ids, max_sequence_length)}
+
+    decoder_input['position_ids'] = torch.arange(0, max_sequence_length, dtype=pos_ids_precision).unsqueeze(0).to(args.device)
+
+    past_key_values = [[torch.zeros((1,32,max_cache_length,96), dtype=cache_precision), torch.zeros((1,32,max_cache_length,96), dtype=cache_precision)] for i in range(32)]
+    decoder_input['past_key_values'] = past_key_values
+
+    decoder_input['attention_mask'] = padding_input_reverse(padding_input(torch.ones((1, init_len), dtype=mask_precision).to(args.device), max_sequence_length), max_cache_length+max_sequence_length)
 
     # run the decoder for the first inference
     with torch.no_grad():
         output = automodel_merged(input_ids=decoder_input['input_ids'],
-                    attention_mask=decoder_input['attention_mask'])
+                    attention_mask=decoder_input['attention_mask'],
+                    past_key_values=decoder_input['past_key_values'],
+                    position_ids=decoder_input['position_ids'])
 
-    # extract past key values and logits for model export in step 3
     logits = output.logits
-    past_key_values = output.past_key_values
-    new_token = torch.argmax(logits[0, - 1, :])
+    tokens = []
+    new_token = torch.argmax(logits[0, init_len-1, :])
+    tokens.append(new_token)
+    print(tokenizer.decode(tokens, skip_special_tokens=False))
 
+    past_key_values = output.past_key_values       
     num_decoder_blocks = len(past_key_values)
     # each item in tuple is for specific layer, each inside tuple has key and value
-    if verbose:
-        print(f"no of blocks: {num_decoder_blocks}, \
-            past decoder key shape = {past_key_values[0][0].shape},\
-            past decoder value shape = {past_key_values[0][1].shape}")
+    print(f"no of blocks: {num_decoder_blocks}, \
+        past decoder key shape = {past_key_values[0][0].shape},\
+        past decoder value shape = {past_key_values[0][1].shape}")
 
     # create input and output names for model conversion
-    input_names = list(decoder_input.keys())
+    input_names = ['input_ids', 'attention_mask']
+    input_names += sum([[f'past_key_values.{idx}.decoder.key',
+              f'past_key_values.{idx}.decoder.value'
+              ] for idx in range(num_decoder_blocks)], [])
+    input_names += ['position_ids']
     output_names = ["logits"] + \
         sum([[f'present_key_values.{idx}.decoder.key',
               f'present_key_values.{idx}.decoder.value'
@@ -148,26 +186,22 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
     if verbose:
         print(f'input names for onnx model is {input_names}, output names for onnx model is {output_names}')
 
-    # encoder output is static
-    # starting seq length can be dynamic for both other inputs, we reshape model to static in base_model.py
-    if export_static:
-        dynamic_axes = None
-        decoder_onnx_path = f"{onnx_output_dir}/{path_name}_decoder_static_non_kvcache_lm.onnx"
-    else:
-        dynamic_axes = {'input_ids': {1: 'seq_len'}, 'attention_mask': {1: 'seq_len'}}
-        decoder_onnx_path = f"{onnx_output_dir}/{path_name}_decoder_dynamic_non_kvcache_lm.onnx"
+    dynamic_axes = None
+    decoder_onnx_path = f"{onnx_output_dir}/{path_name}_decoder_1_prefill.onnx"
 
-    # get onnx model path
+    # Export prefill model
     if force_convert:
         with torch.no_grad():
-            print("Exporting merged_decoder!!!")
+            print("Exporting prefill model!!!")
             torch.onnx.export(
                 model = automodel_merged,
                 args = ({'input_ids': decoder_input['input_ids'],
-                        'attention_mask': decoder_input['attention_mask']}),
+                        'attention_mask': decoder_input['attention_mask'],                        
+                        'past_key_values': decoder_input['past_key_values'],
+                        'position_ids': decoder_input['position_ids']}),
                 f=decoder_onnx_path,
                 verbose=verbose,
-                # opset_version=16,
+                # opset_version=21,
                 input_names=input_names,
                 output_names=output_names,
                 dynamic_axes=dynamic_axes
@@ -184,93 +218,65 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
             remove_duplicate_weights_from_tied_info(
                 model_onnx, automodel_merged, tied_params, save_path=decoder_onnx_path)
 
-    # Step 3: export model with KV cache as input
-    # for this model, we need only one token as input
-    # there are 2 options, either export static decoder model or export dynamic decoder model
-
-    # for dynamic model, we reuse past key values directly which has both encoder and decoder kv cache
-    if not export_static:
-        # dynamic model
-        decoder_input['input_ids'] = torch.tensor([[new_token]], dtype=input_ids_precision).to(args.device)
-        decoder_input['attention_mask'] = torch.cat([decoder_input['attention_mask'], torch.tensor([[1]]).to(args.device)], dim=1).to(mask_precision)
-        decoder_input['past_key_values'] = past_key_values
-        # set dynamic axis
-        dynamic_axes = dict()
-        for idx in range(num_decoder_blocks):
-            dynamic_axes[f'past_key_values.{idx}.decoder.key'] =  {2: 'seq_len'}
-            dynamic_axes[f'past_key_values.{idx}.decoder.value'] = {2: 'seq_len'}
-        # dynamic_axes["attention_mask"] = {1: 'seq_len+1'}
-
-        # get onnx model path
-        decoder_kvcache_onnx_path = f"{onnx_output_dir}/{path_name}_decoder_dynamic_kvcache_{max_sequence_length}_lm.onnx"
-
-    # for static model, we pad the decoder KV cache with 0's and also create the proper attention mask
-    else:
-        decoder_input['input_ids'] = torch.tensor([[new_token]], dtype=input_ids_precision).to(args.device)
-        decoder_input['attention_mask'] = torch.cat([decoder_input['attention_mask'], decoder_input['attention_mask']], dim=1).to(mask_precision)
-        # decoder_input['past_key_values'] = past_key_values
-        
-        decoder_input['past_key_values'] = pad_decoder_cache(past_key_values, None,
-                                                                        0, max_sequence_length*2-1, cache_precision=cache_precision)
-        
-        dynamic_axes = None
-        decoder_kvcache_onnx_path = f"{onnx_output_dir}/{path_name}_decoder_static_kvcache_{max_sequence_length}_lm.onnx"
-
-    # get onnx model path
-
-    # HACK: output_hidden_states is not actually uses for computation inside modeling_whipser file
-    # only used for shape information, hence we test sending dummy value of same size as encoder output
-    # decoder_input['output_hidden_states'] = torch.zeros_like(output_hidden_states).to(args.device)
-    # need to pass this separately
-    # !!! WARNING: Please modify this value according to different model
-    decoder_input['position_ids'] = torch.tensor([args.num_init_tokens], dtype=pos_ids_precision).to(args.device)
-    # decoder_input['position_ids'] = torch.tensor([args.num_init_tokens], dtype=pos_ids_precision).to(args.device)
+    # II. Decoding
+    decoder_input['past_key_values'] = [[kv[0][:,:,init_len:max_cache_length+init_len,:], kv[1][:,:,init_len:max_cache_length+init_len,:]] for kv in past_key_values]
     with torch.no_grad():
-        output = automodel_merged(input_ids=decoder_input['input_ids'],
-                            attention_mask=decoder_input['attention_mask'],
-                            # output_hidden_states=decoder_input['output_hidden_states'],
-                            past_key_values = decoder_input['past_key_values'],
-                            position_ids=decoder_input['position_ids'])
-    # create input and output names for model conversion
-    # add past key values explicitly as inputs
-    input_names += sum([[f'past_key_values.{idx}.decoder.key',
-              f'past_key_values.{idx}.decoder.value'
-              ] for idx in range(num_decoder_blocks)], [])
-    input_names += ['position_ids']
-    # We don't need encoder KV cache as output
-    output_names = ["logits"] + \
-        sum([[f'present_key_values.{idx}.decoder.key',
-              f'present_key_values.{idx}.decoder.value',
-              ] for idx in range(num_decoder_blocks)], [])
-    # print(idx)
+        for i in range(120):
+            decoder_input['position_ids'] = torch.tensor([[init_len]], dtype=pos_ids_precision).to(args.device)
+            decoder_input['attention_mask'] = padding_input_reverse(torch.ones((1, init_len+1), dtype=mask_precision).to(args.device), max_cache_length+1)
+
+            input_ids = torch.zeros((1,1), dtype=input_ids_precision)
+            input_ids[0][0] = new_token
+            decoder_input['input_ids'] = input_ids
+            output = automodel_merged(input_ids=decoder_input['input_ids'],
+                        attention_mask=decoder_input['attention_mask'],
+                        past_key_values=decoder_input['past_key_values'],
+                        position_ids=decoder_input['position_ids'])
+             
+            past_key_values = output.past_key_values
+            decoder_input['past_key_values'] = [[kv[0][:,:,1:max_cache_length+1,:], kv[1][:,:,1:max_cache_length+1,:]] for kv in past_key_values]
+            init_len += 1
+
+            logits = output.logits
+            new_token = torch.argmax(logits[0, 0, :])
+            tokens.append(new_token)
+            print(new_token, tokenizer.decode(tokens, skip_special_tokens=False))
+            if new_token == tokenizer.eos_token_id:
+                break
+    
+
+    dynamic_axes = None
+    decoder_onnx_path = f"{onnx_output_dir}/{path_name}_decoder_2_decode.onnx"
+
+    # Export decode model
     if force_convert:
         with torch.no_grad():
-            print("Exporting merged decoder!!!")
+            print("Exporting decode model!!!")
             torch.onnx.export(
                 model = automodel_merged,
                 args = ({'input_ids': decoder_input['input_ids'],
-                        'attention_mask': decoder_input['attention_mask'],
-                        # 'output_hidden_states': decoder_input['output_hidden_states'],
+                        'attention_mask': decoder_input['attention_mask'],                        
                         'past_key_values': decoder_input['past_key_values'],
-                        'position_ids': decoder_input['position_ids']
-                        }),
-                f=decoder_kvcache_onnx_path,
+                        'position_ids': decoder_input['position_ids']}),
+                f=decoder_onnx_path,
                 verbose=verbose,
-                # opset_version=16,
+                # opset_version=21,
                 input_names=input_names,
                 output_names=output_names,
-                dynamic_axes=dynamic_axes,
+                dynamic_axes=dynamic_axes
                 )
+
         # Checks
-        model_onnx = onnx.load(decoder_kvcache_onnx_path)  # load onnx model
+        model_onnx = onnx.load(decoder_onnx_path)  # load onnx model
         # onnx.checker.check_model(model_onnx)  # check onnx model
         # model_onnx, check = onnxsim.simplify(model_onnx)
         # assert check, "assert check failed"
-        # onnx.save(model_onnx, decoder_kvcache_onnx_path)
+        # onnx.save(model_onnx, decoder_onnx_path)
+
         if len(tied_params) > 0:
             remove_duplicate_weights_from_tied_info(
-                model_onnx, automodel_merged, tied_params, save_path=decoder_kvcache_onnx_path)
-            
+                model_onnx, automodel_merged, tied_params, save_path=decoder_onnx_path)
+
 
 def pad_decoder_cache(past_key_values, padded_past_key_values, inf_iter, max_sequence_length, position_ids=0, cache_precision=torch.float32):
     if args.verbose:
