@@ -30,7 +30,7 @@ try:
     path_name = args.model.split('/')[1].replace('-', '_')
 except:
     path_name = args.model.replace('-', '_')
-onnx_output_dir = f"./logs/models/ori/{path_name}"
+onnx_output_dir = f"./logs/models/{path_name}"
 
 os.makedirs(onnx_output_dir, exist_ok=True)
 
@@ -140,7 +140,7 @@ def padding_input_reverse(input, max_sequence_length):
 
 def export_decoder(output_hidden_states, max_sequence_length, verbose=False, force_convert=False, export_static=True):
     # I. Prefill
-    input_ids = model_inputs.input_ids.to(args.device)
+    input_ids = model_inputs.input_ids.to(args.device).to(input_ids_precision)
     init_len = input_ids.shape[1]
 
     # create decoder input for the first inference
