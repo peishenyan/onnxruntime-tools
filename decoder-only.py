@@ -221,7 +221,7 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
     # II. Decoding
     decoder_input['past_key_values'] = [[kv[0][:,:,init_len:max_cache_length+init_len,:], kv[1][:,:,init_len:max_cache_length+init_len,:]] for kv in past_key_values]
     with torch.no_grad():
-        for i in range(120):
+        for i in range(1):
             decoder_input['position_ids'] = torch.tensor([[init_len]], dtype=pos_ids_precision).to(args.device)
             decoder_input['attention_mask'] = padding_input_reverse(torch.ones((1, init_len+1), dtype=mask_precision).to(args.device), max_cache_length+1)
 
