@@ -1,5 +1,7 @@
 python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l 128 -c 256
-echo 'LOG: Export finished!!!'
+echo 'LOG: Export prefill model finished!!!'
+python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l 128 -c 256 --decode
+echo 'LOG: Export decode model finished!!!'
 model_path="logs/models/Phi_3_mini_4k_instruct/"
 model_list=("Phi_3_mini_4k_instruct_decoder_1_prefill" "Phi_3_mini_4k_instruct_decoder_2_decode")
 

@@ -28,9 +28,10 @@ transformers==4.42.4
 In `decoder-only.py`, we define a new "decoder-only" architecture model with existing "decoder-only" model imported from Huggingface/Transformers, called automodel. With different inputs, we have different forwarding process, which forms the automodel into two types of model: 1) the model with static shape at the first iteration, which has no kv cache as input and has `present_key_values` as output; 2) the model with static shape after the first iteration, which has `past_key_values` as input and `present_key_values` as output.
 ```
 python decoder-only.py --static --export -m $model_name -l $max_sequence_length -c $max_cache_length
+python decoder-only.py --static --export -m $model_name -l $max_sequence_length -c $max_cache_length --decode
 ```
 
-`$model_name` is the official name in Huggingface/Transformers like ``Qwen/Qwen2-0.5B-Instruct''.
+`$model_name` is the official name in Huggingface/Transformers like ``Qwen/Qwen2-0.5B-Instruct''. The first instruction is for generating prefill model and the second is for decode model.
 
 The results are saved in `log/models/$model_name/${model_name}_decoder_1_prefill.onnx` and `log/models/$model_name/${model_name}_decoder_2_decode.onnx` files.  For example, the path is `logs/models/Phi_3_mini_4k_instruct/Phi_3_mini_4k_instruct_decoder_1_prefill.onnx` and `logs/models/Phi_3_mini_4k_instruct/Phi_3_mini_4k_instruct_decoder__decoder_2_decode` if you export model `microsoft/Phi-3-mini-4k-instruct`.
 
@@ -86,3 +87,32 @@ python ort_two_pad.py
 ```
 
 Please remind to modify the model path in `ort_two_pad.py`.
+
+
+## All in one
+According to the logic below, the following script may help, but it has not been verified.
+
+```
+python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l 128 -c 256
+python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l 128 -c 256 --decode
+model_path="logs/models/Phi_3_mini_4k_instruct/"
+model_list=("Phi_3_mini_4k_instruct_decoder_1_prefill" "Phi_3_mini_4k_instruct_decoder_2_decode")
+
+python convert.py -path ${model_list[0]}.onnx
+python opset_convert.py -path ${model_path}${model_list[0]}_ex.onnx -v 21
+rm ${model_path}${model_list[0]}_ex.onnx*
+python quantize_int4.py -path ${model_path}${model_list[0]}_ex_v21.onnx
+rm ${model_path}${model_list[0]}_ex_v21.onnx*
+python pad_two.py -path ${model_path}${model_list[0]}_ex_v21_INT4_QDQ.onnx
+rm ${model_path}${model_list[0]}_ex_v21_INT4_QDQ.onnx*
+python rename.py -i ${model_path}${model_list[0]}_ex_v21_INT4_QDQ_padded.onnx -o ${model_path}1_prefill_INT4_padded.onnx -s 20000000
+
+python convert.py -path ${model_list[1]}.onnx
+python opset_convert.py -path ${model_path}${model_list[1]}_ex.onnx -v 21
+rm ${model_path}${model_list[1]}_ex.onnx*
+python quantize_int4.py -path ${model_path}${model_list[1]}_ex_v21.onnx
+rm ${model_path}${model_list[1]}_ex_v21.onnx*
+python pad_two.py -path ${model_path}${model_list[1]}_ex_v21_INT4_QDQ.onnx --decode
+rm ${model_path}${model_list[1]}_ex_v21_INT4_QDQ.onnx*
+python rename.py -i ${model_path}${model_list[1]}_ex_v21_INT4_QDQ_padded.onnx -o ${model_path}2_decode_INT4_padded.onnx -s 20000000
+```
