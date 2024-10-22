@@ -89,30 +89,9 @@ python ort_two_pad.py
 Please remind to modify the model path in `ort_two_pad.py`.
 
 
-## All in one
-According to the logic below, the following script may help, but it has not been verified.
+## Generate all in one
+According to the logic below, the following script can help you generate the models:
 
 ```
-python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l 128 -c 256
-python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l 128 -c 256 --decode
-model_path="logs/models/Phi_3_mini_4k_instruct/"
-model_list=("Phi_3_mini_4k_instruct_decoder_1_prefill" "Phi_3_mini_4k_instruct_decoder_2_decode")
-
-python convert.py -path ${model_list[0]}.onnx
-python opset_convert.py -path ${model_path}${model_list[0]}_ex.onnx -v 21
-rm ${model_path}${model_list[0]}_ex.onnx*
-python quantize_int4.py -path ${model_path}${model_list[0]}_ex_v21.onnx
-rm ${model_path}${model_list[0]}_ex_v21.onnx*
-python pad_two.py -path ${model_path}${model_list[0]}_ex_v21_INT4_QDQ.onnx
-rm ${model_path}${model_list[0]}_ex_v21_INT4_QDQ.onnx*
-python rename.py -i ${model_path}${model_list[0]}_ex_v21_INT4_QDQ_padded.onnx -o ${model_path}1_prefill_INT4_padded.onnx -s 20000000
-
-python convert.py -path ${model_list[1]}.onnx
-python opset_convert.py -path ${model_path}${model_list[1]}_ex.onnx -v 21
-rm ${model_path}${model_list[1]}_ex.onnx*
-python quantize_int4.py -path ${model_path}${model_list[1]}_ex_v21.onnx
-rm ${model_path}${model_list[1]}_ex_v21.onnx*
-python pad_two.py -path ${model_path}${model_list[1]}_ex_v21_INT4_QDQ.onnx --decode
-rm ${model_path}${model_list[1]}_ex_v21_INT4_QDQ.onnx*
-python rename.py -i ${model_path}${model_list[1]}_ex_v21_INT4_QDQ_padded.onnx -o ${model_path}2_decode_INT4_padded.onnx -s 20000000
+bash generate.sh
 ```
