@@ -10,7 +10,7 @@ args = parser.parse_args()
     
 model_path = args.in_name
 model_external_path = args.out_name
-fn = args.out_name+ '.data'
+fn = args.out_name.split('/')[-1] + '.data'
 
 onnx_model = onnx.load(model_path)
 convert_model_to_external_data(onnx_model, all_tensors_to_one_file=True, location=fn, size_threshold=args.size)
