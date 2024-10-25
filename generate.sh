@@ -1,6 +1,8 @@
-python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l 128 -c 256
+max_input_len=128
+max_cache_len=256
+python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l ${max_input_len} -c ${max_cache_len}
 echo 'LOG: Export prefill model finished!!!'
-python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l 128 -c 256 --decode
+python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l ${max_input_len} -c ${max_cache_len} --decode
 echo 'LOG: Export decode model finished!!!'
 model_path="logs/models/Phi_3_mini_4k_instruct/"
 temp_path="logs/models/done/"
@@ -17,7 +19,7 @@ rm ${model_path}${model_list[0]}_ex_v21.onnx*
 python pad_two.py -path ${model_path}${model_list[0]}_ex_v21_INT4_QDQ.onnx
 echo 'LOG 1: Aligning model output with input finished.'
 rm ${model_path}${model_list[0]}_ex_v21_INT4_QDQ.onnx*
-python rename.py -i ${model_path}${model_list[0]}_ex_v21_INT4_QDQ_final.onnx -o ${model_path}1_prefill_INT4_final.onnx -s 20000000
+python rename.py -i ${model_path}${model_list[0]}_ex_v21_INT4_QDQ_final.onnx -o ${model_path}1_prefill_INT4_${max_input_len}_${max_cache_len}.onnx -s 20000000
 rm ${model_path}${model_list[0]}_ex_v21_INT4_QDQ_final.onnx*
 echo 'LOG 1: Renaming model finished.'
 
@@ -32,11 +34,11 @@ rm ${model_path}${model_list[1]}_ex_v21.onnx*
 python pad_two.py -path ${model_path}${model_list[1]}_ex_v21_INT4_QDQ.onnx --decode
 echo 'LOG 2: Aligning model output with input finished.'
 rm ${model_path}${model_list[1]}_ex_v21_INT4_QDQ.onnx*
-python rename.py -i ${model_path}${model_list[1]}_ex_v21_INT4_QDQ_final.onnx -o ${model_path}2_decode_INT4_final.onnx -s 20000000  
+python rename.py -i ${model_path}${model_list[1]}_ex_v21_INT4_QDQ_final.onnx -o ${model_path}2_decode_INT4_${max_input_len}_${max_cache_len}.onnx -s 20000000  
 rm ${model_path}${model_list[1]}_ex_v21_INT4_QDQ_final.onnx*
 echo 'LOG 2: Renaming model finished.'
 
 mkdir ${temp_path}
-mv ${model_path}1_prefill_INT4_final.onnx* ${temp_path}
-mv ${model_path}2_decode_INT4_final.onnx* ${temp_path}
+mv ${model_path}1_prefill_INT4_${max_input_len}_${max_cache_len}.onnx* ${temp_path}
+mv ${model_path}2_decode_INT4_${max_input_len}_${max_cache_len}.onnx* ${temp_path}
 rm -r ${model_path}
