@@ -1,8 +1,8 @@
 max_input_len=128
 max_cache_len=256
-python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l ${max_input_len} -c ${max_cache_len}
+python decoder-only.py -m microsoft/Phi-3-mini-4k-instruct -l ${max_input_len} -c ${max_cache_len}
 echo 'LOG: Export prefill model finished!!!'
-python decoder-only.py --static --export -m microsoft/Phi-3-mini-4k-instruct -l ${max_input_len} -c ${max_cache_len} --decode
+python decoder-only.py -m microsoft/Phi-3-mini-4k-instruct -l ${max_input_len} -c ${max_cache_len} --decode
 echo 'LOG: Export decode model finished!!!'
 model_path="logs/models/Phi_3_mini_4k_instruct/"
 temp_path="logs/models/done/"

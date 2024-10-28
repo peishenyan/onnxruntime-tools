@@ -30,7 +30,7 @@ for tensor in graph.input:
 zero_tensor = helper.make_tensor('value_zero', onnx.TensorProto.INT32, [], [0])
 graph.initializer.extend([zero_tensor])
 
-# Get the value of max_cache_length and max_text_length
+ # Get the value of max_cache_length and max_text_length
 shape_node_1 = helper.make_node(
     'Shape',
     name='attn_mask_shape',
@@ -54,6 +54,7 @@ max_cache_len_node = helper.make_node(
     outputs=['max_cache_len']
 )
 
+# Prepare range(max_cache_len), range(max_seq_len), and range(max_seq_len+max_cache_len)
 ones_node_1 = helper.make_node(
     'ConstantOfShape',
     name='one_of_attn_mask',
@@ -70,6 +71,14 @@ ones_node_2 = helper.make_node(
     value=helper.make_tensor('value_one', onnx.TensorProto.INT32, [1], [1])
 )
 
+ones_node_3 = helper.make_node(
+    'ConstantOfShape',
+    name='one_of_input_ids_shape',
+    inputs=['input_ids_shape'],
+    outputs=['input_ids_shape_ones'],
+    value=helper.make_tensor('value_one', onnx.TensorProto.INT32, [1], [1])
+)
+
 range_node_1 = helper.make_node(
     'CumSum',
     name='range_of_attn_mask',
@@ -77,23 +86,54 @@ range_node_1 = helper.make_node(
     outputs=['mask_range'],
 )
 
-# [1,2,3,...]
+
 range_node_2 = helper.make_node(
     'CumSum',
     name='range_of_max_cache_len',
     inputs=['max_cache_len_ones', 'value_zero'],
     outputs=['gather_range'],
 )
-graph.node.extend([shape_node_1, shape_node_2, max_cache_len_node, ones_node_1, ones_node_2, range_node_1, range_node_2])
+
+range_node_3 = helper.make_node(
+    'CumSum',
+    name='range_of_input_ids_shape',
+    inputs=['input_ids_shape_ones', 'value_zero'],
+    outputs=['mask_gather_range'],
+    exclusive=1,
+) # start from 0
+graph.node.extend([shape_node_1, shape_node_2, max_cache_len_node, ones_node_1, ones_node_2, ones_node_3, range_node_1, range_node_2, range_node_3])
 
 
+### Slice attention mask
+cast_node = helper.make_node(
+    'Cast',
+    name='max_cache_lenn_cast',
+    inputs=['max_cache_len'],
+    outputs=['mask_gather_addition'],
+    to=TensorProto.INT32
+)
+
+add_node = helper.make_node(
+    'Add',
+    inputs=['mask_gather_range', 'mask_gather_addition'],
+    outputs=['mask_gather_indices']
+)
+
+gather_node = helper.make_node(
+    'Gather',
+    inputs=['attention_mask', 'mask_gather_indices'],
+    outputs=['sliced_attention_mask'],
+    axis=1
+)
+graph.node.extend([cast_node, add_node, gather_node])
+
+# 
 mul_node = helper.make_node(
     'Mul',
-    inputs=['attention_mask', 'mask_range'],
+    inputs=['sliced_attention_mask', 'mask_gather_indices'],
     outputs=['attention_mask_pos']
 )
 
-# input_ids = [1], attention_mask_pos = 128
 argmax_node = helper.make_node(
     'ArgMax',
     name='Gather_position',
@@ -103,17 +143,10 @@ argmax_node = helper.make_node(
     keepdims=0
 )
 
-sub_node = helper.make_node(
-    'Sub',
-    name='gather_sub',
-    inputs=['argmax_res', 'max_cache_len'],
-    outputs=['gather_addition_0']
-)
-
 cast_node = helper.make_node(
     'Cast',
     name='gather_addition_cast',
-    inputs=['gather_addition_0'],
+    inputs=['argmax_res'],
     outputs=['gather_addition'],
     to=TensorProto.INT32
 )
@@ -123,8 +156,7 @@ add_node = helper.make_node(
     inputs=['gather_range', 'gather_addition'],
     outputs=['gather_indices']
 )
-
-graph.node.extend([mul_node, argmax_node, sub_node, cast_node, add_node])
+graph.node.extend([mul_node, argmax_node, cast_node, add_node])
 
 for i, output in enumerate(graph.output):
     if 'logits' in output.name:

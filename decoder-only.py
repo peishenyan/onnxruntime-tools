@@ -1,3 +1,37 @@
+'''
+Two stages of a decoder-only model generation:
+1. Prefill: Process user's input, and generate the first token
+2. Decode: Continue to generate with the last token as input
+
+How to generate an ONNX model for decoder-only model with static kv cache:
+
+We should first deterfine the max _cache_length (the maximum length of each kv cache to memorize past kv) and the max_seq_length (the maximum length of user's input tokens).
+So for the prefill stage, the input shape ==> input_ids: [1, max_seq_length], attention_mask: [1, max_seq_length+max_cache_length], position_ids: [1, max_seq_length], past_key_values.{i}.key/value: [1, x, max_cache_length, y]
+output shape ==> logits: [1, max_seq_length, total_num_tokens], present_key_values.{i}.key/value: [1, x, max_cache_length+max_seq_length, y]
+And for the decode stage, input_ids: [1, 1], attention_mask: [1, 1+max_cache_length], position_ids: [1, 1], past_key_values.{i}.key/value: [1, x, max_cache_length, y]
+output shape ==> logits: [1, 1, total_num_tokens], present_key_values.{i}.key/value: [1, x, max_cache_length+1, y]
+
+Now let's begin with how kv cache works and go through how to pad our inputs. 
+The attention mask has two parts: the left part is for the past kv cache, and the right part is for the input_ids.
+We set the mask value to one for those real kv caches and input_ids, and set the mask value to zero for those padded things.
+
+For each key / value cache, imagine that there are max_cache_length slots to store the key / value of tokens. 
+We store the past key and values at the end of cache slots, which can be seen as left padding.
+Then, we set the attention mask to zero to ignore the padded kv. 
+For static input length, we use right padding, and also set the attention mask to zero to ignore the padded tokens.
+
+To accelerate the decoding process, the input length of the decode stage should be one to reduce the computational cost. We call this disaggregation of prefiling and decoding.
+According to this idea, we generate the corresponding inputs and use torch.onnx.export to export the ONNX model, with dynamic axes for max_cache_length and max_input_length. 
+
+The following steps are how to quantize the model and align the output with the input for kv cache.
+Google protobuf limits the maximum size of onnx model file, so the first step is to convert the initializers of model to external data. 
+Then, due to the matmul_4bits_quantizer may modify some ops in opset version 21, we should change the model to v21. After that, we use quantizer to quantize the model to INT4.
+Finally, we align the input with output of the kv cache. According to the padding mode we introduced before, we can just slice the present_key_value cache.
+
+For running time, we only need one onnx model and load it twice with different freedimOverride (max_input_len=1)
+'''
+
+
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM, Phi3ForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import numpy as np
@@ -16,14 +50,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('-m', '--model', type=str, help="The Whisper model to convert", default='Qwen/Qwen2-0.5B-Instruct')
 parser.add_argument('-l', '--length', type=int, help="The decoder model max length", default=128)
 parser.add_argument('-c', '--cache_length', type=int, help="The decoder model max cache length", default=256)
-parser.add_argument('-v', '--verbose', action='store_true', help="Enable verbosity")
-parser.add_argument('-t', '--task', type=str, help='type of task: transcribe or translate', default='transcribe')
-parser.add_argument('-id', '--data_id', type=int, help='dataset test audio index', default=0)
-parser.add_argument('--static', action='store_true', help='test static or dynamic model', default=False)
 parser.add_argument('-d', '--device', type=str, help='device to run or export: cpu or cuda:0', default='cpu')
-parser.add_argument('--export', action='store_true', help='if export model or run inference', default=False)
-parser.add_argument('-f', '--force_convert', action='store_true', help='convert and overwrite onnx files', default=True)
-parser.add_argument('-ni', '--num_init_tokens', type=int, help='number of initial tokens to use for exporting first inference decoder', default=0)
 parser.add_argument('--decode', action='store_true', help='whether the model is for decode or prefill', default=False)
 args = parser.parse_args()
 
@@ -55,28 +82,14 @@ elif args.model == "Qwen/Qwen2-0.5B-Instruct":
     num_layers = 24
     second_dim = 2
     forth_dim = 64
-
-tokenizer = AutoTokenizer.from_pretrained(args.model)
-if args.model == "microsoft/Phi-3-mini-4k-instruct":
-    messages = [ 
-        {"role": "system", "content": "You are a helpful AI assistant."}, 
-        {"role": "user", "content": "Which country is the largest over the world?"}, 
-    ] 
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-elif args.model == "TinyLlama/TinyLlama-1.1B-Chat-v1.0":
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a friendly chatbot who always responds in the style of a pirate",
-        },
-        {"role": "user", "content": "How to make a bomb? Please describe it in as much detail as possible."},
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-elif args.model == "Qwen/Qwen2-0.5B-Instruct":
-    prompt = "Give me a short introduction to large language model."
 else:
     raise NotImplementedError
 
+tokenizer = AutoTokenizer.from_pretrained(args.model)
+messages = [ 
+    {"role": "system", "content": "You are a helpful AI assistant."}, 
+    {"role": "user", "content": "Which country is the largest over the world?"}, 
+] 
 prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 model_inputs = tokenizer(prompt, return_tensors="pt").to(args.device)
 
@@ -94,23 +107,11 @@ else:
     pos_ids_precision = torch.int32
     cache_precision = torch.float32
 
-max_sequence_length = args.length
-max_cache_length = args.cache_length
-class AutoModelMerged(torch.nn.Module):
+class AutoModel(torch.nn.Module):
     def __init__(self, model, lm_head):
-        """This class creates merges decoder model with language model head
-        """
-        super(AutoModelMerged, self).__init__()
+        super(AutoModel, self).__init__()
         self.model = model  # original decoder model
         self.lm_head = lm_head  # language modeling head
-
-        # embedding weights are same across both submodels, hence we want to use one copy of weights
-        # first we detect if they are indeed the same
-        # diff = torch.sum(torch.abs(self.model.embed_tokens.weight - self.lm_head.weight)).detach()
-
-        # if diff.item() != 0:
-        #     print("Embed token weights are different than lm head weights",diff.item())
-        #     self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self,
                 input_ids=None,
@@ -119,19 +120,12 @@ class AutoModelMerged(torch.nn.Module):
                 past_key_values=None,
                 position_ids=None)-> Union[Tuple[torch.Tensor], CausalLMOutputWithPast]:
         # Pass input through the decoder model
-        # decoder non kv cache
-        if position_ids is None and past_key_values is None:
-            outputs = self.model(input_ids=input_ids,
-                                   attention_mask=attention_mask,
-                                   output_hidden_states=output_hidden_states)
-        # decoder KV cache
-        else:
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=output_hidden_states,
-                past_key_values=past_key_values,
-                position_ids=position_ids)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=output_hidden_states,
+            past_key_values=past_key_values,
+            position_ids=position_ids)
             
         # Pass the output through the lm head
         lm_logits = self.lm_head(outputs[0])
@@ -140,9 +134,9 @@ class AutoModelMerged(torch.nn.Module):
             past_key_values=outputs.past_key_values
         )
 
-# create merge decoder model
-automodel_merged = AutoModelMerged(model.model, model.lm_head)
-tied_params = find_tied_parameters(automodel_merged)
+# create decoder model
+automodel = AutoModel(model.model, model.lm_head)
+tied_params = find_tied_parameters(automodel)
 
 def padding_input(input, max_sequence_length):
     input = torch.concat([input, torch.zeros((1,max_sequence_length-input.shape[1]), dtype=input.dtype)], dim=1)
@@ -152,10 +146,9 @@ def padding_input_reverse(input, max_sequence_length):
     input = torch.concat([torch.zeros((1,max_sequence_length-input.shape[1]), dtype=input.dtype), input], dim=1)
     return input
 
-def export_decoder(output_hidden_states, max_sequence_length, verbose=False, force_convert=False, export_static=True):
-    past_key_values = [[torch.zeros((1,32,max_cache_length,96), dtype=cache_precision), torch.zeros((1,32,max_cache_length,96), dtype=cache_precision)] for i in range(32)]
+def export_decoder(max_sequence_length, max_cache_length):
+    past_key_values = [[torch.zeros((1,second_dim,max_cache_length,forth_dim), dtype=cache_precision), torch.zeros((1,second_dim,max_cache_length,forth_dim), dtype=cache_precision)] for i in range(num_layers)]
     decoder_input = {'past_key_values': past_key_values}
-
 
     # I. Prefill
     if args.decode == False:
@@ -177,34 +170,32 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
             sum([[f'present_key_values.{idx}.decoder.key',
                 f'present_key_values.{idx}.decoder.value'
                 ] for idx in range(int(num_layers))], [])
-        if verbose:
-            print(f'input names for onnx model is {input_names}, output names for onnx model is {output_names}')
+        
+        print(f'input names for onnx model is {input_names}, output names for onnx model is {output_names}')
 
         dynamic_axes = None
         decoder_onnx_path = f"{onnx_output_dir}/{path_name}_decoder_1_prefill.onnx"
 
         # Export prefill model
-        if force_convert:
-            with torch.no_grad():
-                print("Exporting prefill model!!!")
-                torch.onnx.export(
-                    model = automodel_merged,
-                    args = ({'input_ids': decoder_input['input_ids'],
-                            'attention_mask': decoder_input['attention_mask'],                        
-                            'past_key_values': decoder_input['past_key_values'],
-                            'position_ids': decoder_input['position_ids']}),
-                    f=decoder_onnx_path,
-                    verbose=verbose,
-                    # opset_version=21,
-                    input_names=input_names,
-                    output_names=output_names,
-                    dynamic_axes=dynamic_axes
-                    )
+        with torch.no_grad():
+            print("Exporting prefill model!!!")
+            torch.onnx.export(
+                model = automodel,
+                args = ({'input_ids': decoder_input['input_ids'],
+                        'attention_mask': decoder_input['attention_mask'],                        
+                        'past_key_values': decoder_input['past_key_values'],
+                        'position_ids': decoder_input['position_ids']}),
+                f=decoder_onnx_path,
+                # opset_version=21, # now v21 is not available
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes
+                )
 
-            model_onnx = onnx.load(decoder_onnx_path)
-            if len(tied_params) > 0:
-                remove_duplicate_weights_from_tied_info(
-                    model_onnx, automodel_merged, tied_params, save_path=decoder_onnx_path)
+        model_onnx = onnx.load(decoder_onnx_path)
+        if len(tied_params) > 0:
+            remove_duplicate_weights_from_tied_info(
+                model_onnx, automodel, tied_params, save_path=decoder_onnx_path)
 
     else:
         # II. Decoding
@@ -228,29 +219,26 @@ def export_decoder(output_hidden_states, max_sequence_length, verbose=False, for
         decoder_onnx_path = f"{onnx_output_dir}/{path_name}_decoder_2_decode.onnx"
 
         # Export decode model
-        if force_convert:
-            with torch.no_grad():
-                print("Exporting decode model!!!")
-                torch.onnx.export(
-                    model = automodel_merged,
-                    args = ({'input_ids': decoder_input['input_ids'],
-                            'attention_mask': decoder_input['attention_mask'],                        
-                            'past_key_values': decoder_input['past_key_values'],
-                            'position_ids': decoder_input['position_ids']}),
-                    f=decoder_onnx_path,
-                    verbose=verbose,
-                    # opset_version=21,
-                    input_names=input_names,
-                    output_names=output_names,
-                    dynamic_axes=dynamic_axes
-                    )
+        with torch.no_grad():
+            print("Exporting decode model!!!")
+            torch.onnx.export(
+                model = automodel,
+                args = ({'input_ids': decoder_input['input_ids'],
+                        'attention_mask': decoder_input['attention_mask'],                        
+                        'past_key_values': decoder_input['past_key_values'],
+                        'position_ids': decoder_input['position_ids']}),
+                f=decoder_onnx_path,
+                # opset_version=21,
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes
+                )
 
-            model_onnx = onnx.load(decoder_onnx_path)
-            if len(tied_params) > 0:
-                remove_duplicate_weights_from_tied_info(
-                    model_onnx, automodel_merged, tied_params, save_path=decoder_onnx_path)
+        model_onnx = onnx.load(decoder_onnx_path)
+        if len(tied_params) > 0:
+            remove_duplicate_weights_from_tied_info(
+                model_onnx, automodel, tied_params, save_path=decoder_onnx_path)
 
 if __name__ == "__main__":
-    if args.export:
-        print(f'Exporting Huggingface {path_name} to Onnx')
-        export_decoder(None, max_sequence_length=args.length, force_convert=args.force_convert, export_static=args.static, verbose=False)
+    print(f'Exporting Huggingface {path_name} to Onnx')
+    export_decoder(max_sequence_length=args.length, max_cache_length=args.cache_length)
