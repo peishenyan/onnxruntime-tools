@@ -14,14 +14,15 @@ model_name = model_prefix.split('/')[-1]
 model_path = model_prefix+'.onnx'
 
 model = onnx.load(model_path)
-
 graph = model.graph
-new_outputs = []
-
-
-indices = []
 
 attention_sink_len = args.attn_sink
+new_input = helper.make_tensor_value_info('attention_sink_len', onnx.TensorProto.INT32, [1])
+model.graph.input.append(new_input)
+
+new_outputs = []
+indices = []
+
 kv_shape = None
 kv_denote = None
 for tensor in graph.input:
@@ -31,11 +32,20 @@ for tensor in graph.input:
 
 zero_tensor = helper.make_tensor('value_zero', onnx.TensorProto.INT32, [], [0])
 one_tensor = helper.make_tensor('value_one', onnx.TensorProto.INT64, [], [1])
-sink_len_tensor = helper.make_tensor('sink_len', onnx.TensorProto.INT32, [], [attention_sink_len])
-sink_len_int64_tensor = helper.make_tensor('sink_len_int64', onnx.TensorProto.INT64, [], [attention_sink_len])
-sink_range_tensor = helper.make_tensor('sink_range', onnx.TensorProto.INT32, [attention_sink_len], range(attention_sink_len))
-graph.initializer.extend([zero_tensor, one_tensor, sink_len_tensor, sink_len_int64_tensor, sink_range_tensor])
+# sink_1d_tensor = helper.make_tensor('sink_len_1D', onnx.TensorProto.INT32, [1], [attention_sink_len])
+# sink_len_tensor = helper.make_tensor('sink_len', onnx.TensorProto.INT32, [], [attention_sink_len])
+# sink_len_int64_tensor = helper.make_tensor('sink_len_int64', onnx.TensorProto.INT64, [], [attention_sink_len])
+# sink_range_tensor = helper.make_tensor('sink_range', onnx.TensorProto.INT32, [attention_sink_len], range(attention_sink_len))
+graph.initializer.extend([zero_tensor, one_tensor]) #, sink_1d_tensor, sink_len_tensor, sink_len_int64_tensor, sink_range_tensor])
 
+
+cast_node = helper.make_node(
+    'Cast',
+    name='attention_sink_len_cast',
+    inputs=['attention_sink_len'],
+    outputs=['sink_len_int64'],
+    to=TensorProto.INT64
+)
  # Get the value of max_cache_length and max_text_length
 shape_node_1 = helper.make_node(
     'Shape',
@@ -67,7 +77,7 @@ right_cache_len_node = helper.make_node(
     inputs=['max_cache_len', 'sink_len_int64'],
     outputs=['right_cache_len']
 )
-graph.node.extend([shape_node_1, shape_node_2, max_cache_len_node, right_cache_len_node])
+graph.node.extend([cast_node, shape_node_1, shape_node_2, max_cache_len_node, right_cache_len_node])
 
 # Prepare range(max_cache_len), range(max_seq_len), and range(max_seq_len+max_cache_len)
 ones_node_1 = helper.make_node(
@@ -79,16 +89,29 @@ ones_node_1 = helper.make_node(
 )
 ones_node_2 = helper.make_node(
     'ConstantOfShape',
-    name='one_of_right_cache_len',
-    inputs=['right_cache_len'],
-    outputs=['right_cache_len_ones'],
+    name='one_of_max_cache_len',
+    inputs=['max_cache_len'],
+    outputs=['max_cache_len_ones'],
     value=helper.make_tensor('value_1', onnx.TensorProto.INT32, [1], [1])
+)
+slice_node = helper.make_node(
+    'Slice',
+    name='one_of_right_cache_len',
+    inputs=['max_cache_len_ones', 'attention_sink_len', 'mask_gather_addition'],
+    outputs=['right_cache_len_ones']
 )
 ones_node_3 = helper.make_node(
     'ConstantOfShape',
     name='one_of_input_ids_shape',
     inputs=['input_ids_shape'],
     outputs=['input_ids_shape_ones'],
+    value=helper.make_tensor('value_1', onnx.TensorProto.INT32, [1], [1])
+)
+ones_node_4 = helper.make_node(
+    'ConstantOfShape',
+    name='one_attention_sink_shape',
+    inputs=['sink_len_int64'],
+    outputs=['attention_sink_len_ones'],
     value=helper.make_tensor('value_1', onnx.TensorProto.INT32, [1], [1])
 )
 range_node_1 = helper.make_node(
@@ -111,7 +134,14 @@ range_node_3 = helper.make_node(
     outputs=['mask_gather_range'],
     exclusive=1,
 ) # start from 0
-graph.node.extend([ ones_node_1, ones_node_2, ones_node_3, range_node_1, range_node_2, range_node_3])
+range_node_4 = helper.make_node(
+    'CumSum',
+    name='range_of_attention_sink_len',
+    inputs=['attention_sink_len_ones', 'value_zero'],
+    outputs=['sink_range'],
+    exclusive=1,
+) # start from 0
+graph.node.extend([ ones_node_1, ones_node_2, slice_node, ones_node_3, ones_node_4, range_node_1, range_node_2, range_node_3, range_node_4])
 
 
 ### Slice attention mask
@@ -125,12 +155,14 @@ cast_node = helper.make_node(
 
 add_node = helper.make_node(
     'Add',
+    name='mask_gather_range_add',
     inputs=['mask_gather_range', 'mask_gather_addition'],
     outputs=['mask_gather_indices']
 )
 
 gather_node = helper.make_node(
     'Gather',
+    name='attention_mask_gather',
     inputs=['attention_mask', 'mask_gather_indices'],
     outputs=['sliced_attention_mask'],
     axis=1
@@ -140,12 +172,14 @@ graph.node.extend([cast_node, add_node, gather_node])
 # Calculate argmax for right attention mask and argmin for all attention mask 
 mul_node_1 = helper.make_node(
     'Mul',
+    name='attention_mask_mul',
     inputs=['attention_mask', 'mask_range'],
     outputs=['attention_mask_pos']
 )
 
 mul_node_2 = helper.make_node(
     'Mul',
+    name='sliced_attention_mask_mul',
     inputs=['sliced_attention_mask', 'mask_gather_indices'],
     outputs=['right_attention_mask_pos']
 )
@@ -186,6 +220,7 @@ add_node = helper.make_node(
 
 min_node = helper.make_node(
     'Min',
+    name='min_for_left_gather',
     inputs=['input_len', 'min_one_pos'],
     outputs=['left_gather_addition_0']
 ) # left gather indices start at min(input_len, max(0,max_cache_len-start_len)) = min(input_len, min_one_pos)
@@ -215,12 +250,13 @@ add_node_1 = helper.make_node(
 add_node_2 = helper.make_node(
     'Add',
     name='add_2',
-    inputs=['right_gather_indices_0', 'sink_len'],
+    inputs=['right_gather_indices_0', 'attention_sink_len'],
     outputs=['right_gather_indices']
 )
 
 concat_node = helper.make_node(
     'Concat',
+    name='gather_indices_concat',
     inputs=['left_gather_indices', 'right_gather_indices'],
     outputs=['gather_indices'],
     axis=0
@@ -270,6 +306,7 @@ for i, output in enumerate(graph.output):
 
         gather_node = helper.make_node(
             'Gather',
+            name='gather/'+output.name,
             inputs=[output.name, 'gather_indices'],
             outputs=['new_'+output.name],
             axis=2
